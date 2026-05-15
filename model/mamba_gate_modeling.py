@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 import torch.distributed as dist
+import time
 
 from transformers import initialization as init
 from transformers.activations import ACT2FN
@@ -173,17 +174,21 @@ class MambaCache_Gate:
             self.conv_states[layer_idx].zero_()
             self.ssm_states[layer_idx].zero_()
 
+def shard_tensor(tensor, world_size, dim=0):
+    chunks = torch.tensor_split(tensor, world_size, dim=dim)
+    return chunks
 
 class MambaMixer(nn.Module):
 
     def __init__(self, config: MambaConfig, layer_idx: int):
         super().__init__()
         self.config = config
+        self.rank = config.rank
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.local_intermediate_size = self.config.local_intermediate_size
-        # self.local_intermediate_size = self.intermediate_size // self.config.world_size
+        # self.local_intermediate_size = self.intermediate_size # // self.config.world_size
         # assert self.local_intermediate_size * self.config.world_size == self.intermediate_size
 
         # Activation function
@@ -193,7 +198,7 @@ class MambaMixer(nn.Module):
         self.in_proj = nn.Linear(self.hidden_size, self.local_intermediate_size , bias=config.use_bias)
 
         # Output projection (full, not split)
-        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
+        self.out_proj = nn.Linear(self.local_intermediate_size, self.hidden_size, bias=config.use_bias)
 
     # fmt: off
     def slow_forward(self, input_states):
@@ -204,15 +209,26 @@ class MambaMixer(nn.Module):
         gate = self.act(gate)
         gate = gate.contiguous()
 
-        in_proj_weights = self.in_proj.weight           
+        in_proj_weights = self.in_proj.weight  
 
-        if dist.is_initialized() and self.config.world_size > 1:
-            gathered_gate = [torch.zeros_like(gate) for _ in range(dist.get_world_size())]
-            dist.all_gather(gathered_gate, gate)
-            gate = torch.cat(gathered_gate, dim=1)
-        
+        scan_output = torch.ones(batch_size, self.local_intermediate_size, seq_len).to(self.config.device)
+        if dist.is_initialized():
+
+            # Recive scan_out tensor shards
+            for ssm_rank in self.config.reshard_strategy:
+                start = self.config.reshard_strategy[ssm_rank][0]
+                end = self.config.reshard_strategy[ssm_rank][1] + 1
+                # print(f"Layer number: {self.layer_idx}, From gate rank {self.rank}. recieve scan output from rank {ssm_rank}, from {start} to end {end}, size is {gate[:,start:end,:].size()}")
+                dist.irecv(scan_output[:,start:end,:], src=ssm_rank)
+
+            # Distribute gate tensor shard
+            for ssm_rank in self.config.reshard_strategy:
+                start = self.config.reshard_strategy[ssm_rank][0]
+                end = self.config.reshard_strategy[ssm_rank][1] + 1
+                # print(f"Layer number: {self.layer_idx}, From gate rank {self.rank}. Send gate to rank {ssm_rank}, from {start} to end {end}, size is {gate[:,start:end,:].size()}")
+                dist.isend(gate[:,start:end,:].contiguous(), dst=ssm_rank)
+
         set_seed(42)
-        scan_output = torch.ones(batch_size, self.intermediate_size, seq_len).to(self.config.device)
 
         scan_output = scan_output * gate
 
@@ -427,11 +443,18 @@ class MambaModel_Gate(MambaPreTrainedModel_Gate):
 
         batch_size, seq_len, _ = inputs_embeds.shape
 
+        torch.cuda.synchronize()
+
+        start = time.perf_counter() 
+
         for mixer_block in self.layers:
             hidden_states = mixer_block(
                 hidden_states,
                 counter=counter
             )
+
+            if dist.is_initialized():
+                dist.all_reduce(hidden_states, group=self.config.local_group)
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -440,6 +463,12 @@ class MambaModel_Gate(MambaPreTrainedModel_Gate):
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
+        
+        torch.cuda.synchronize()
+
+        end = time.perf_counter()
+
+        logging.info(f"Gate, {batch_size}, {seq_len}, {self.config.rank}, {counter}, {start}, {end}")
 
         if not return_dict:
             return tuple(v for v in [hidden_states, cache_params, all_hidden_states] if v is not None)

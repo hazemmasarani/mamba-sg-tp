@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 import torch.distributed as dist
+import time
 
 from transformers import initialization as init
 from transformers.activations import ACT2FN
@@ -181,6 +182,7 @@ class MambaMixer(nn.Module):
     def __init__(self, config: MambaConfig, layer_idx: int):
         super().__init__()
         self.config = config
+        self.rank = config.rank
         self.hidden_size = config.hidden_size
         self.ssm_state_size = config.state_size
         self.conv_kernel_size = config.conv_kernel
@@ -270,7 +272,7 @@ class MambaMixer(nn.Module):
 
         # All_reduce ssm_parameters
         if dist.is_initialized():
-            dist.all_reduce(ssm_parameters)
+            dist.all_reduce(ssm_parameters, group=self.config.local_group)
 
         time_step, B, C = torch.split(
             ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1
@@ -289,12 +291,24 @@ class MambaMixer(nn.Module):
             hs = pscan(discrete_A.transpose(1, 2), deltaB_u.transpose(1, 2)) # [batch, seq_len, intermediate_size, ssm_state_size]
             scan_output = (hs @ C.unsqueeze(-1)).squeeze(3).transpose(1, 2) # [batch, intermediate_size, seq_len]
             scan_output = scan_output + hidden_states * self.D[None, :, None]
-            gate = torch.randn(batch_size, self.local_intermediate_size, seq_len).to(scan_output.device)
-            # if dist.is_initialized():
-            #     dist.broadcast(scan_output, src=1)
-            #     dist.broadcast(gate, src=0)
-            # else:
-            #     print("Not distributed Error")
+
+            gate = torch.ones(batch_size, self.local_intermediate_size, seq_len).to(scan_output.device)
+            if dist.is_initialized():
+                # Distribute scan_output tensor shard
+                for gate_rank in self.config.reshard_strategy:
+                    start = self.config.reshard_strategy[gate_rank][0]
+                    end = self.config.reshard_strategy[gate_rank][1] + 1
+                    # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Send Scan output to rank {gate_rank}, from {start} to end {end}")
+                    dist.isend(scan_output[:,start:end,:].contiguous(), dst=gate_rank)
+
+                # Recive gate tensor shards
+                for gate_rank in self.config.reshard_strategy:
+                    start = self.config.reshard_strategy[gate_rank][0]
+                    end = self.config.reshard_strategy[gate_rank][1] + 1
+                    # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Recieve Gate from rank {gate_rank}, from {start} to end {end}")
+                    dist.irecv(gate[:,start:end,:], src=gate_rank)
+
+
             scan_output = scan_output * gate
         else:
             scan_outputs = []
@@ -305,12 +319,24 @@ class MambaMixer(nn.Module):
             scan_output = torch.stack(scan_outputs, dim=-1)                                # [batch, intermediate_size, seq_len]
             scan_output = scan_output + (hidden_states * self.D[None, :, None])
             scan_output = scan_output.contiguous()
-            gate = torch.randn(batch_size, self.local_intermediate_size, seq_len).to(scan_output.device)
-            # if dist.is_initialized():
-            #     dist.broadcast(scan_output, src=1)
-            #     dist.broadcast(gate, src=0)
-            # else:
-            #     print("Not distributed Error")
+
+
+            gate = torch.ones(batch_size, self.local_intermediate_size, seq_len).to(scan_output.device)
+            if dist.is_initialized():
+                # Distribute scan_output tensor shard
+                for gate_rank in self.config.reshard_strategy:
+                    start = self.config.reshard_strategy[gate_rank][0]
+                    end = self.config.reshard_strategy[gate_rank][1] + 1
+                    # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Send Scan output to rank {gate_rank}, from {start} to end {end}, size is {scan_output[:,start:end,:].size()}")
+                    dist.isend(scan_output[:,start:end,:].contiguous(), dst=gate_rank)
+
+                # Recive gate tensor shards
+                for gate_rank in self.config.reshard_strategy:
+                    start = self.config.reshard_strategy[gate_rank][0]
+                    end = self.config.reshard_strategy[gate_rank][1] + 1
+                    # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Recieve Gate from rank {gate_rank}, from {start} to end {end}, size is {gate[:,start:end,:].size()}")
+                    dist.irecv(gate[:,start:end,:], src=gate_rank)
+            
             scan_output = scan_output * gate
 
             if cache_params is not None:
@@ -559,6 +585,10 @@ class MambaModel_SSM(MambaPreTrainedModel_SSM):
         
         batch_size, seq_len, _ = inputs_embeds.shape
 
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+
         for mixer_block in self.layers:
             hidden_states = mixer_block(
                 hidden_states,
@@ -568,7 +598,7 @@ class MambaModel_SSM(MambaPreTrainedModel_SSM):
             )
 
             if dist.is_initialized():
-                dist.all_reduce(hidden_states)
+                dist.all_reduce(hidden_states, group = self.config.local_group)
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -577,6 +607,12 @@ class MambaModel_SSM(MambaPreTrainedModel_SSM):
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
+
+        torch.cuda.synchronize()
+
+        end = time.perf_counter()
+
+        logging.info(f"SSM, {batch_size}, {seq_len}, {self.config.rank}, {counter}, {start}, {end}")
 
         if not return_dict:
             return tuple(v for v in [hidden_states, cache_params, all_hidden_states] if v is not None)
