@@ -223,7 +223,7 @@ class MambaMixer(nn.Module):
         self.use_bias = config.use_bias
 
     # fmt: off
-    def slow_forward(self, input_states, cache_params: MambaCache_SSM | None=None, cache_position:torch.LongTensor | None=None, attention_mask: torch.LongTensor | None = None):
+    def slow_forward(self, input_states, cache_params: MambaCache_SSM | None=None, cache_position:torch.LongTensor | None=None, attention_mask: torch.LongTensor | None = None, counter = None):
 
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
@@ -292,22 +292,118 @@ class MambaMixer(nn.Module):
             scan_output = (hs @ C.unsqueeze(-1)).squeeze(3).transpose(1, 2) # [batch, intermediate_size, seq_len]
             scan_output = scan_output + hidden_states * self.D[None, :, None]
 
-            gate = torch.ones(batch_size, self.local_intermediate_size, seq_len).to(scan_output.device)
+            torch.cuda.synchronize()
+
+            start_timer = time.perf_counter()
+
+            # output = gate
+            gate = torch.empty(
+                self.local_intermediate_size, batch_size, seq_len,
+                device=scan_output.device
+            )
+
             if dist.is_initialized():
-                # Distribute scan_output tensor shard
-                for gate_rank in self.config.reshard_strategy:
-                    start = self.config.reshard_strategy[gate_rank][0]
-                    end = self.config.reshard_strategy[gate_rank][1] + 1
-                    # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Send Scan output to rank {gate_rank}, from {start} to end {end}")
-                    dist.isend(scan_output[:,start:end,:].contiguous(), dst=gate_rank)
+                world_size = dist.get_world_size()
 
-                # Recive gate tensor shards
-                for gate_rank in self.config.reshard_strategy:
-                    start = self.config.reshard_strategy[gate_rank][0]
-                    end = self.config.reshard_strategy[gate_rank][1] + 1
-                    # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Recieve Gate from rank {gate_rank}, from {start} to end {end}")
-                    dist.irecv(gate[:,start:end,:], src=gate_rank)
+                # output_split_sizes = gate_split_sizes
+                gate_split_sizes = []
+                for rank in range(world_size):
+                    size = 0
+                    if rank in self.config.reshard_strategy:
+                        start, end = self.config.reshard_strategy[rank]
+                        end += 1
+                        size = end - start
+                    gate_split_sizes.append(size)
+            
+                # input = scan_output
+                scan_output = scan_output.movedim(1,0)
+                scan_output = scan_output.contiguous()
 
+                # input_split_Sizes = scan_output_splits
+                scan_output_splits = gate_split_sizes.copy()
+
+                # all_to_all_single
+                dist.all_to_all_single(
+                    output = gate,
+                    input = scan_output,
+                    output_split_sizes = gate_split_sizes,
+                    input_split_sizes = scan_output_splits,
+                    group = None
+                )
+
+                # return to normal dimensions
+                scan_output = scan_output.movedim(0,1)
+                gate = gate.movedim(0,1)
+
+            # gate = torch.empty(
+            #     batch_size, self.local_intermediate_size, seq_len,
+            #     device=scan_output.device
+            # )
+
+            # if dist.is_initialized():
+            #     world_size = dist.get_world_size()
+
+            #     # Step 1: build send list (send scan_output to others)
+            #     send_list = []
+            #     for rank in range(world_size):
+            #         if rank in self.config.reshard_strategy:
+            #             start, end = self.config.reshard_strategy[rank]
+            #             end += 1
+            #             chunk = scan_output[:, start:end, :].contiguous()
+            #         else:
+            #             chunk = torch.empty(
+            #                 batch_size, 0, seq_len,
+            #                 device=scan_output.device
+            #             )
+            #         send_list.append(chunk)
+
+            #     # Step 2: prepare receive list (receive gate from others)
+            #     recv_list = []
+            #     for rank in range(world_size):
+            #         if rank in self.config.reshard_strategy:
+            #             start, end = self.config.reshard_strategy[rank]
+            #             end += 1
+            #             size = end - start
+            #         else:
+            #             size = 0
+
+            #         recv_chunk = torch.empty(
+            #             batch_size, size, seq_len,
+            #             device=scan_output.device
+            #         )
+            #         recv_list.append(recv_chunk)
+
+            #     # Step 3: all-to-all
+            #     dist.all_to_all(recv_list, send_list)
+
+            #     # Step 4: reconstruct gate tensor
+            #     for rank in range(world_size):
+            #         if rank in self.config.reshard_strategy:
+            #             start, end = self.config.reshard_strategy[rank]
+            #             end += 1
+            #             gate[:, start:end, :] = recv_list[rank]
+
+            # gate = torch.ones(batch_size, self.local_intermediate_size, seq_len).to(scan_output.device)
+            # if dist.is_initialized():
+            #     # Distribute scan_output tensor shard
+            #     for gate_rank in self.config.reshard_strategy:
+            #         start = self.config.reshard_strategy[gate_rank][0]
+            #         end = self.config.reshard_strategy[gate_rank][1] + 1
+            #         # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Send Scan output to rank {gate_rank}, from {start} to end {end}")
+            #         dist.isend(scan_output[:,start:end,:].contiguous(), dst=gate_rank)
+
+            #     # Recive gate tensor shards
+            #     for gate_rank in self.config.reshard_strategy:
+            #         start = self.config.reshard_strategy[gate_rank][0]
+            #         end = self.config.reshard_strategy[gate_rank][1] + 1
+            #         # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Recieve Gate from rank {gate_rank}, from {start} to end {end}")
+            #         dist.irecv(gate[:,start:end,:], src=gate_rank)
+
+            torch.cuda.synchronize()
+
+            end_timer = time.perf_counter()
+
+            logging.info(f"SSM-comm, {batch_size}, {seq_len}, {self.config.rank}, {self.layer_idx}, {counter}, {start_timer}, {end_timer}")
 
             scan_output = scan_output * gate
         else:
@@ -320,23 +416,123 @@ class MambaMixer(nn.Module):
             scan_output = scan_output + (hidden_states * self.D[None, :, None])
             scan_output = scan_output.contiguous()
 
+            torch.cuda.synchronize()
 
-            gate = torch.ones(batch_size, self.local_intermediate_size, seq_len).to(scan_output.device)
+            start_timer = time.perf_counter()
+
+            # output = gate
+            gate = torch.empty(
+                self.local_intermediate_size, batch_size, seq_len,
+                device=scan_output.device
+            )
+
             if dist.is_initialized():
-                # Distribute scan_output tensor shard
-                for gate_rank in self.config.reshard_strategy:
-                    start = self.config.reshard_strategy[gate_rank][0]
-                    end = self.config.reshard_strategy[gate_rank][1] + 1
-                    # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Send Scan output to rank {gate_rank}, from {start} to end {end}, size is {scan_output[:,start:end,:].size()}")
-                    dist.isend(scan_output[:,start:end,:].contiguous(), dst=gate_rank)
+                world_size = dist.get_world_size()
 
-                # Recive gate tensor shards
-                for gate_rank in self.config.reshard_strategy:
-                    start = self.config.reshard_strategy[gate_rank][0]
-                    end = self.config.reshard_strategy[gate_rank][1] + 1
-                    # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Recieve Gate from rank {gate_rank}, from {start} to end {end}, size is {gate[:,start:end,:].size()}")
-                    dist.irecv(gate[:,start:end,:], src=gate_rank)
+                # output_split_sizes = gate_split_sizes
+                gate_split_sizes = []
+                for rank in range(world_size):
+                    size = 0
+                    if rank in self.config.reshard_strategy:
+                        start, end = self.config.reshard_strategy[rank]
+                        end += 1
+                        size = end - start
+                    gate_split_sizes.append(size)
             
+                # input = scan_output
+                scan_output = scan_output.movedim(1,0)
+                scan_output = scan_output.contiguous()
+
+                # input_split_Sizes = scan_output_splits
+                scan_output_splits = gate_split_sizes.copy()
+
+                # all_to_all_single
+                dist.all_to_all_single(
+                    output = gate,
+                    input = scan_output,
+                    output_split_sizes = gate_split_sizes,
+                    input_split_sizes = scan_output_splits,
+                    group = None
+                )
+
+                # return to normal dimensions
+                scan_output = scan_output.movedim(0,1)
+                gate = gate.movedim(0,1)
+            
+            print(f"from SSM rank {rank} Dim of gate: {gate.shape}")
+            print(f"from SSM rank {rank} Dim of scan_output: {scan_output.shape}")
+            
+
+            # gate = torch.empty(
+            #     batch_size, self.local_intermediate_size, seq_len,
+            #     device=scan_output.device
+            # )
+
+            # if dist.is_initialized():
+            #     world_size = dist.get_world_size()
+
+            #     # Step 1: build send list (send scan_output to others)
+            #     send_list = []
+            #     for rank in range(world_size):
+            #         if rank in self.config.reshard_strategy:
+            #             start, end = self.config.reshard_strategy[rank]
+            #             end += 1
+            #             chunk = scan_output[:, start:end, :].contiguous()
+            #         else:
+            #             chunk = torch.empty(
+            #                 batch_size, 0, seq_len,
+            #                 device=scan_output.device
+            #             )
+            #         send_list.append(chunk)
+
+            #     # Step 2: prepare receive list (receive gate from others)
+            #     recv_list = []
+            #     for rank in range(world_size):
+            #         if rank in self.config.reshard_strategy:
+            #             start, end = self.config.reshard_strategy[rank]
+            #             end += 1
+            #             size = end - start
+            #         else:
+            #             size = 0
+
+            #         recv_chunk = torch.empty(
+            #             batch_size, size, seq_len,
+            #             device=scan_output.device
+            #         )
+            #         recv_list.append(recv_chunk)
+
+            #     # Step 3: all-to-all
+            #     dist.all_to_all(recv_list, send_list)
+
+            #     # Step 4: reconstruct gate tensor
+            #     for rank in range(world_size):
+            #         if rank in self.config.reshard_strategy:
+            #             start, end = self.config.reshard_strategy[rank]
+            #             end += 1
+            #             gate[:, start:end, :] = recv_list[rank]
+
+            # gate = torch.ones(batch_size, self.local_intermediate_size, seq_len).to(scan_output.device)
+            # if dist.is_initialized():
+            #     # Distribute scan_output tensor shard
+            #     for gate_rank in self.config.reshard_strategy:
+            #         start = self.config.reshard_strategy[gate_rank][0]
+            #         end = self.config.reshard_strategy[gate_rank][1] + 1
+            #         # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Send Scan output to rank {gate_rank}, from {start} to end {end}, size is {scan_output[:,start:end,:].size()}")
+            #         dist.isend(scan_output[:,start:end,:].contiguous(), dst=gate_rank)
+
+            #     # Recive gate tensor shards
+            #     for gate_rank in self.config.reshard_strategy:
+            #         start = self.config.reshard_strategy[gate_rank][0]
+            #         end = self.config.reshard_strategy[gate_rank][1] + 1
+            #         # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Recieve Gate from rank {gate_rank}, from {start} to end {end}, size is {gate[:,start:end,:].size()}")
+            #         dist.irecv(gate[:,start:end,:], src=gate_rank)
+            
+            torch.cuda.synchronize()
+
+            end_timer = time.perf_counter()
+
+            logging.info(f"SSM-comm, {batch_size}, {seq_len}, {self.config.rank}, {self.layer_idx}, {counter}, {start_timer}, {end_timer}")
+
             scan_output = scan_output * gate
 
             if cache_params is not None:
@@ -353,8 +549,9 @@ class MambaMixer(nn.Module):
         cache_params: MambaCache_SSM | None = None,
         cache_position: torch.LongTensor | None = None,
         attention_mask: torch.LongTensor | None = None,
+        counter = None
     ):
-        return self.slow_forward(hidden_states, cache_params, cache_position, attention_mask)
+        return self.slow_forward(hidden_states, cache_params, cache_position, attention_mask, counter)
 
 
 class MambaRMSNorm(nn.Module):
@@ -391,7 +588,8 @@ class MambaBlock(GradientCheckpointingLayer):
         hidden_states,
         cache_params: MambaCache_SSM | None = None,
         cache_position: torch.LongTensor | None = None,
-        attention_mask: torch.LongTensor | None = None
+        attention_mask: torch.LongTensor | None = None,
+        counter = None
     ):
         residual = hidden_states
         hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
@@ -399,7 +597,7 @@ class MambaBlock(GradientCheckpointingLayer):
             residual = residual.to(torch.float32)
 
         hidden_states = self.mixer(
-            hidden_states, cache_params=cache_params, cache_position=cache_position, attention_mask=attention_mask
+            hidden_states, cache_params=cache_params, cache_position=cache_position, attention_mask=attention_mask, counter = counter
         )
         hidden_states = residual + hidden_states
         return hidden_states
@@ -595,6 +793,7 @@ class MambaModel_SSM(MambaPreTrainedModel_SSM):
                 cache_params=cache_params,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
+                counter = counter
             )
 
             if dist.is_initialized():
@@ -612,7 +811,7 @@ class MambaModel_SSM(MambaPreTrainedModel_SSM):
 
         end = time.perf_counter()
 
-        logging.info(f"SSM, {batch_size}, {seq_len}, {self.config.rank}, {counter}, {start}, {end}")
+        logging.info(f"SSM, {batch_size}, {seq_len}, {self.config.rank},, {counter}, {start}, {end}")
 
         if not return_dict:
             return tuple(v for v in [hidden_states, cache_params, all_hidden_states] if v is not None)

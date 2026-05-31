@@ -243,8 +243,8 @@ if __name__ == "__main__":
     world_size = 4
     
     devices_map = {
-        "gate": {0:"cuda:0"},
-        "ssm": {1:"cuda:1", 2:"cuda:2", 3:"cuda:3"},
+        "gate": {0:"cuda:0", 1:"cuda:1"},
+        "ssm": {2:"cuda:2", 3:"cuda:3"},
     }
 
     processes = []
