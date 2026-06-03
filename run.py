@@ -141,6 +141,8 @@ def run_ssm(rank, world_size, devices_map, num_cycles):
     state_dict = read_split_state_dict_ssm("./model/state_dict_ssm.pt", rank - ssm_offset, config.world_size)
     model.load_state_dict(state_dict, strict=False)
 
+    print(f"Starting forward SSM cycle.")
+
     # # Dummy input
     # # input_ids = torch.ones((1, 128), dtype=torch.long).to(device)
     input_ids = torch.load("./input/input_ids.pt").to(device)
@@ -207,6 +209,8 @@ def run_gate(rank, world_size, devices_map, num_cycles):
     state_dict = read_split_state_dict_gate("./model/state_dict_gate.pt", rank, config.world_size)
     model.load_state_dict(state_dict, strict=False)
 
+    print(f"Starting forward gate cycle.")
+
     # # Dummy input
     # # input_ids = torch.ones((1, 128), dtype=torch.long).to(device)
     input_ids = torch.load("./input/input_ids.pt").to(device)
@@ -244,7 +248,7 @@ if __name__ == "__main__":
     
     devices_map = {
         "gate": {0:"cuda:0", 1:"cuda:1"},
-        "ssm": {2:"cuda:2", 3:"cuda:3"},
+        "ssm": { 2:"cuda:2", 3:"cuda:3"},
     }
 
     processes = []

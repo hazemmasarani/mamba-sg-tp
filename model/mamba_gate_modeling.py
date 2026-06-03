@@ -212,10 +212,63 @@ class MambaMixer(nn.Module):
         in_proj_weights = self.in_proj.weight  
 
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
-        start_timer = time.perf_counter()
+        # start_timer = time.perf_counter()
 
+        
+        # print(f"from Gate rank {self.rank}, waiting for resharding.")
+
+        # Rank 0 (gate device)
+        
+        # target_chunk_size = int(math.ceil(self.intermediate_size/3.0) * 3)
+
+        # # Send Gate tensor
+        # # Pad gate if needed
+        # if gate.shape[1] < target_chunk_size:
+        #     pad_size = target_chunk_size - gate.shape[1]
+        #     pad = torch.zeros(batch_size, pad_size, seq_len, device=gate.device)
+        #     gate = torch.cat([gate, pad], dim=1)
+
+        # chunks = list(gate.chunk(3, dim = 1))
+
+        # chunks.insert(0, torch.zeros_like(chunks[0]))
+
+        # dist.scatter(
+        #     tensor=chunks[0],       # output tensor (receiver buffer)
+        #     scatter_list=chunks,    # list of tensors to send (only on src)
+        #     src=0                   # source rank
+        # )
+
+        # gate = gate[:, :self.local_intermediate_size, :]
+
+
+        # # recieve scan_output tensor
+
+        # scan_output = torch.empty(
+        #     batch_size, target_chunk_size, seq_len,
+        #     device=self.config.device
+        # )
+
+        # # Split into 3 chunks along dim=1
+        # scan_output = list(scan_output.chunk(3, dim=1))
+
+        # # Add dummy tensor for rank 0 (since it has no SSM output)
+        # scan_output.insert(0, torch.zeros_like(scan_output[0]))
+
+        # # Gather: only rank 0 provides gather_list
+        # dist.gather(
+        #     tensor=scan_output[0],     # this rank's own tensor (can be dummy)
+        #     gather_list=scan_output,     # list to receive tensors from all ranks
+        #     dst=0
+        # )
+
+        # # restore the scan_out list
+        # scan_output.pop(0)
+        # scan_output = torch.cat(scan_output, dim=1)
+        # scan_output = scan_output[:, :self.local_intermediate_size, :]
+
+        ####################################################################
 
         # output = scan_output
         scan_output = torch.empty(
@@ -256,8 +309,8 @@ class MambaMixer(nn.Module):
             scan_output = scan_output.movedim(0,1)
             gate = gate.movedim(0,1)
 
-        print(f"from Gate rank {rank} Dim of gate: {gate.shape}")
-        print(f"from Gate rank {rank} Dim of scan_output: {scan_output.shape}")
+        # print(f"from Gate rank {rank} Dim of gate: {gate.shape}")
+        # print(f"from Gate rank {rank} Dim of scan_output: {scan_output.shape}")
 
         # scan_output = torch.empty(
         #     batch_size, self.local_intermediate_size, seq_len,
@@ -326,11 +379,11 @@ class MambaMixer(nn.Module):
         #         # print(f"Layer number: {self.layer_idx}, From gate rank {self.rank}. Send gate to rank {ssm_rank}, from {start} to end {end}, size is {gate[:,start:end,:].size()}")
         #         dist.isend(gate[:,start:end,:].contiguous(), dst=ssm_rank)
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
-        end_timer = time.perf_counter()
+        # end_timer = time.perf_counter()
 
-        logging.info(f"Gate-comm, {batch_size}, {seq_len}, {self.config.rank}, {self.layer_idx}, {counter}, {start_timer}, {end_timer}")
+        # logging.info(f"Gate-comm, {batch_size}, {seq_len}, {self.config.rank}, {self.layer_idx}, {counter}, {start_timer}, {end_timer}")
 
         set_seed(42)
 
@@ -558,8 +611,8 @@ class MambaModel_Gate(MambaPreTrainedModel_Gate):
                 counter=counter
             )
 
-            if dist.is_initialized():
-                dist.all_reduce(hidden_states, group=self.config.local_group)
+            # if dist.is_initialized():
+            #     dist.all_reduce(hidden_states, group=self.config.local_group)
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -569,7 +622,7 @@ class MambaModel_Gate(MambaPreTrainedModel_Gate):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
         
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
         end = time.perf_counter()
 

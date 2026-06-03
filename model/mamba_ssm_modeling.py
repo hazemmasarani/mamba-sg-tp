@@ -292,9 +292,41 @@ class MambaMixer(nn.Module):
             scan_output = (hs @ C.unsqueeze(-1)).squeeze(3).transpose(1, 2) # [batch, intermediate_size, seq_len]
             scan_output = scan_output + hidden_states * self.D[None, :, None]
 
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
 
-            start_timer = time.perf_counter()
+            # start_timer = time.perf_counter()
+
+            # print(f"from SSM rank {rank}, waiting for resharding.")
+
+            target_chunk_size = int(math.ceil(self.intermediate_size/3.0))
+
+            gate = torch.empty(
+                batch_size, target_chunk_size, seq_len,
+                device=scan_output.device
+            )
+
+            dist.scatter(
+                gate,
+                src=0
+            )
+
+            gate = gate[:, :self.local_intermediate_size, :]
+
+            # send scan_output
+            # Pad scan_output if needed
+            if gate.shape[1] < target_chunk_size:
+                pad_size = target_chunk_size - gate.shape[1]
+                pad = torch.zeros(batch_size, pad_size, seq_len, device=gate.device)
+                gate = torch.cat([gate, pad], dim=1)
+
+            dist.gather(
+                scan_output,
+                dst=0
+            )
+
+            scan_output = scan_output[:, :self.local_intermediate_size, :]
+
+            #########################################################################
 
             # output = gate
             gate = torch.empty(
@@ -399,11 +431,11 @@ class MambaMixer(nn.Module):
             #         # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Recieve Gate from rank {gate_rank}, from {start} to end {end}")
             #         dist.irecv(gate[:,start:end,:], src=gate_rank)
 
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
 
-            end_timer = time.perf_counter()
+            # end_timer = time.perf_counter()
 
-            logging.info(f"SSM-comm, {batch_size}, {seq_len}, {self.config.rank}, {self.layer_idx}, {counter}, {start_timer}, {end_timer}")
+            # logging.info(f"SSM-comm, {batch_size}, {seq_len}, {self.config.rank}, {self.layer_idx}, {counter}, {start_timer}, {end_timer}")
 
             scan_output = scan_output * gate
         else:
@@ -416,9 +448,36 @@ class MambaMixer(nn.Module):
             scan_output = scan_output + (hidden_states * self.D[None, :, None])
             scan_output = scan_output.contiguous()
 
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
 
-            start_timer = time.perf_counter()
+            # start_timer = time.perf_counter()
+            
+            # print(f"from SSM rank {self.rank}, waiting for resharding.")
+
+            # target_chunk_size = int(math.ceil(self.intermediate_size/3.0))
+
+            # gate = torch.empty(
+            #     batch_size, target_chunk_size, seq_len,
+            #     device=scan_output.device
+            # )
+
+            # dist.scatter(
+            #     gate,
+            #     src=0
+            # )
+
+            # gate = gate[:, :self.local_intermediate_size, :]
+
+            # # send scan_output
+
+            # dist.gather(
+            #     scan_output,
+            #     dst=0
+            # )
+
+            # scan_output = scan_output[:, :self.local_intermediate_size, :]
+
+            #########################################################################
 
             # output = gate
             gate = torch.empty(
@@ -459,8 +518,8 @@ class MambaMixer(nn.Module):
                 scan_output = scan_output.movedim(0,1)
                 gate = gate.movedim(0,1)
             
-            print(f"from SSM rank {rank} Dim of gate: {gate.shape}")
-            print(f"from SSM rank {rank} Dim of scan_output: {scan_output.shape}")
+            # print(f"from SSM rank {rank} Dim of gate: {gate.shape}")
+            # print(f"from SSM rank {rank} Dim of scan_output: {scan_output.shape}")
             
 
             # gate = torch.empty(
@@ -527,11 +586,11 @@ class MambaMixer(nn.Module):
             #         # print(f"Layer number: {self.layer_idx}, From SSM rank {self.rank}. Recieve Gate from rank {gate_rank}, from {start} to end {end}, size is {gate[:,start:end,:].size()}")
             #         dist.irecv(gate[:,start:end,:], src=gate_rank)
             
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
 
-            end_timer = time.perf_counter()
+            # end_timer = time.perf_counter()
 
-            logging.info(f"SSM-comm, {batch_size}, {seq_len}, {self.config.rank}, {self.layer_idx}, {counter}, {start_timer}, {end_timer}")
+            # logging.info(f"SSM-comm, {batch_size}, {seq_len}, {self.config.rank}, {self.layer_idx}, {counter}, {start_timer}, {end_timer}")
 
             scan_output = scan_output * gate
 
@@ -699,7 +758,6 @@ class MambaCausalLMOutput(ModelOutput):
     logits: torch.FloatTensor | None = None
     cache_params: MambaCache_SSM | None = None
     hidden_states: tuple[torch.FloatTensor] | None = None
-
 
 class MambaModel_SSM(MambaPreTrainedModel_SSM):
     def __init__(self, config):

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-NUM_ITER=100
+NUM_ITER=200
 
 run_case () {
     local BATCH=$1
