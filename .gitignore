@@ -1,6 +1,6 @@
 # Any data redundant
+log
 *.pt
-*.log
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -29,6 +29,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

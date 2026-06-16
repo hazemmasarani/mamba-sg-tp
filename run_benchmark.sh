@@ -10,7 +10,7 @@ run_case () {
     do
         echo "Running batch_size=$BATCH seq_len=$SEQ num_iter=$NUM_ITER"
 
-        python run.py \
+        python run_1.py \
             -batch_size $BATCH \
             -seq_len $SEQ \
             -num_iter $NUM_ITER
