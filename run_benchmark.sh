@@ -1,6 +1,6 @@
 #!/bin/bash
 
-NUM_ITER=200
+NUM_ITER=513
 
 run_case () {
     local BATCH=$1
@@ -10,7 +10,7 @@ run_case () {
     do
         echo "Running batch_size=$BATCH seq_len=$SEQ num_iter=$NUM_ITER"
 
-        python run_1.py \
+        python run_1_cache.py \
             -batch_size $BATCH \
             -seq_len $SEQ \
             -num_iter $NUM_ITER
@@ -44,7 +44,7 @@ run_experiments () {
     done
 }
 
-run_experiments 1 1024
+run_experiments 1 512
 run_experiments 2 512
 run_experiments 4 256
 run_experiments 8 128

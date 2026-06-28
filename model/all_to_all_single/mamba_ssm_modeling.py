@@ -115,6 +115,7 @@ class MambaCache_SSM:
         self.max_batch_size = max_batch_size
         self._dtype = dtype
         self.intermediate_size = config.intermediate_size
+        self.local_intermediate_size = config.local_intermediate_size
         self.ssm_state_size = config.state_size
         self.conv_kernel_size = config.conv_kernel
 
@@ -124,14 +125,14 @@ class MambaCache_SSM:
         for _ in range(config.num_hidden_layers):
             conv_state: torch.Tensor = torch.zeros(
                 self.max_batch_size,
-                self.intermediate_size,
+                self.local_intermediate_size,
                 self.conv_kernel_size,
                 device=device,
                 dtype=self._dtype,
             )
             ssm_state: torch.Tensor = torch.zeros(
                 self.max_batch_size,
-                self.intermediate_size,
+                self.local_intermediate_size,
                 self.ssm_state_size,
                 device=device,
                 dtype=self._dtype,
